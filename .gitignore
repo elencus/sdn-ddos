@@ -1,0 +1,14 @@
+# p4 generated files
+part2-p4/build/
+part2-p4/logs/
+part2-p4/pcaps/
+*.pcap
+*.json.log
+
+# python
+__pycache__/
+*.pyc
+
+# venv simlink
+utils
+EOF
