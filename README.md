@@ -1,13 +1,14 @@
 # DDoS Detection and Mitigation in SDN
 
 A seminar project comparing two approaches to the same problem — detecting
-a DDoS attack — implemented with different SDN technologies:
+and mitigating a DDoS (SYN flood) attack — implemented with different SDN
+technologies:
 
 - **Part 1:** reactive detection via an external controller (ONOS + Mininet)
-- **Part 2:** detection in the data plane itself (P4 + bmv2)
+- **Part 2:** detection directly in the data plane (P4 + bmv2)
 
-The goal is to show the difference between having decisions made by a
-centralized controller versus made directly inside the switch.
+The goal is to show the difference between decisions made by a centralized
+controller versus decisions made inside the switch itself.
 
 ## Technologies
 
@@ -16,7 +17,7 @@ centralized controller versus made directly inside the switch.
 | Mininet | network emulation |
 | Open vSwitch | software OpenFlow switch (Part 1) |
 | ONOS | external SDN controller (Part 1) |
-| Python + REST | detector reading stats and installing rules |
+| Python + REST | detector reading stats and installing rules (Part 1) |
 | P4 / bmv2 | programmable switch, detection in data plane (Part 2) |
 | hping3, iperf3 | attack generation and measurement |
 
@@ -29,16 +30,22 @@ sdn-proekt/
 ├── part1-onos/
 │   ├── topo.py           Mininet topology
 │   ├── detector.py       detector via ONOS REST API
-│   └── rezultati.md      measured results
+│   └── rezultati.md      Part 1 results
 └── part2-p4/
-    └── ddos.p4           P4 program (data plane detection)
+    ├── ddos.p4           P4 program (data-plane detection)
+    ├── topology.json     network topology
+    ├── s1-runtime.json   initial table entries (control plane)
+    ├── monitor.py        reads switch registers
+    └── rezultati.md      Part 2 results
 ```
+
+---
 
 ## Part 1 — ONOS + Mininet
 
 ### Idea
 
-ONOS controls the network and installs forwarding rules that match on
+ONOS controls the network and installs forwarding rules that match on the
 source IP address, so every source has its own packet counter. A Python
 script (`detector.py`) periodically reads these counters through the ONOS
 REST API, computes a per-source packets-per-second rate, and if a source
@@ -50,13 +57,12 @@ outside the switch, in software.
 ### Topology
 
 ```
-   h1, h2 (users)     ─┐
-                       ├─ s1 ──[10 Mbps]── s2 ── srv (victim)
-   a1, a2 (attackers) ─┘
+   h1, h2 (users)      -----+
+                            +--- s1 ---[10 Mbps]--- s2 --- srv (victim)
+   a1, a2 (attackers)  -----+
 ```
 
-The s1–s2 link is limited to 10 Mbps to act as a bottleneck where the
-effect of the attack is visible.
+The s1-s2 link is capped at 10 Mbps to act as a bottleneck.
 
 ### Running
 
@@ -95,52 +101,103 @@ mininet> a1 hping3 -S -p 80 -i u2000 10.0.0.10 &
 | Attack, no defense | 6.50 ms | 0.26 Mbps |
 | Attack, with defense | 0.96 ms | 9.54 Mbps |
 
-- Reaction time (detection → block): **~83 ms**
+- Reaction time (detection -> block): **~83 ms**
 - Throughput drop under attack: **~31x**
 - A single drop rule discarded **over 33,000** attack packets
 
-See [part1-onos/rezultati.md](part1-onos/rezultati.md) for details.
+Details: [part1-onos/rezultati.md](part1-onos/rezultati.md)
+
+---
 
 ## Part 2 — P4 + bmv2
 
 ### Idea
 
-The same detection, but implemented in the **data plane** itself. The P4
-program counts SYN packets per source using registers and hashing, and
-when a source exceeds the threshold the switch starts dropping its packets
-on its own — with no controller involved.
+The same detection, implemented in the **data plane** itself. The P4 program
+counts SYN packets per source using registers and hashing (CRC32 into 4096
+buckets), and when a source exceeds the threshold the switch drops its
+packets on its own — with no controller involved.
 
 The key difference from Part 1: the reaction happens inside the switch, in
 microseconds, instead of going through an external controller.
 
-### Running
+### Topology
 
 ```
-(to be filled in when Part 2 is complete)
+   h1 (user)       -----+
+   h2 (attacker)   -----+--- s1 (P4 switch)
+   h3 (server)     -----+
+```
+
+In Part 2 all hosts must start with "h" — a constraint of the P4 tutorials
+runner script — so the attacker is h2 and the server is h3.
+
+### Running
+
+```bash
+cd part2-p4
+sudo mn -c
+make run        # compiles ddos.p4, starts bmv2, loads table entries
+```
+
+Attack from Mininet:
+
+```
+mininet> h2 hping3 -S -p 80 -i u2000 10.0.3.3 &
+```
+
+Inspect detector state (second terminal):
+
+```bash
+python3 monitor.py           # show blocked sources and drop counts
+python3 monitor.py --reset   # reset for a new demo
 ```
 
 ### Results
 
-```
-(to be filled in)
-```
-
-## Comparison
-
-| | ONOS (controller) | P4 (data plane) |
+| Scenario | h1 avg latency | h1 packet loss |
 |---|---|---|
-| Where the logic lives | in the controller (Python) | in the switch |
-| Reaction time | tens of ms | microseconds |
-| Controller load | high | minimal |
-| Logic flexibility | very high | limited (no loops) |
-| Visibility | aggregated flow counters | per packet |
+| Baseline | 5.59 ms | 0% |
+| h1 while h2 attacks | 5.02 ms | 0% |
+| After block | 4.68 ms | 0% |
+
+- Packets allowed before block = **threshold (200)**, then all dropped
+- h1 latency essentially **unchanged** even during the attack
+- Detector state confirmed in registers: attacker blocked, 30,000+ dropped
+
+Details: [part2-p4/rezultati.md](part2-p4/rezultati.md)
+
+---
+
+## Comparison — the two approaches
+
+| | Part 1 — ONOS (controller) | Part 2 — P4 (data plane) |
+|---|---|---|
+| Where the decision is made | controller (Python) | switch pipeline |
+| Reaction time | ~83 ms | microseconds |
+| Packets before block | thousands | exactly the threshold (200) |
+| Impact on legitimate traffic | latency ~6x higher | practically none |
+| Logic flexibility | very high (easy to change) | limited (no loops, fixed memory) |
+| Visibility | aggregated flow counters | per-packet, in registers |
+| Controller load | high (every new flow) | minimal |
+
+**Takeaway:** the controller-based approach is flexible and easy to program,
+but the switch must send traffic to the controller, wait for a decision, and
+install a rule — so the legitimate user feels the attack for tens of
+milliseconds. The P4 approach decides for every packet inside the switch, so
+the attacker is blocked in microseconds and legitimate traffic is barely
+affected — at the cost of a more constrained programming model.
+
+---
 
 ## Notes
 
-- The server also exceeds the rate threshold because it replies to the SYN
-  packets, so it had to be explicitly whitelisted. This shows that real
-  DDoS systems must account for false positives.
+- In Part 1 the server also exceeds the rate threshold because it replies to
+  every SYN, so it had to be explicitly whitelisted. Real DDoS systems face
+  exactly this false-positive problem.
 - bmv2 is a software switch, so absolute throughput numbers are not
-  representative of hardware; the point is the relative comparison between
-  the two approaches.
+  representative of hardware. The relative comparison between the two
+  approaches is what matters.
+- Both parts are separate demonstrations sharing the same theme; the network
+  layouts and host names differ between them.
 
